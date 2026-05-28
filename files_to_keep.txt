@@ -1,0 +1,31 @@
+================================================================================
+  gwas_mr_reference/ — Reference Data Directory
+================================================================================
+
+This folder holds the large reference files needed by the pipeline.
+It is NOT included in the repository — you must download and extract
+the files yourself.
+
+DOWNLOAD LINK (Google Drive, .zip):
+https://drive.google.com/file/d/1aCkPs33M_voS77A1YC9p0qS7FTzzC6Ja/view?usp=drive_link
+
+After extracting, also download and place PLINK 1.9 + the 1000G EUR
+reference panel (see README.md step 3 for links).
+
+EXPECTED FOLDER STRUCTURE:
+
+gwas_mr_reference/
+├── GWAS-DATABASE-FTP.tsv                        GWAS Catalog index with FTP URLs
+├── GTEx_eQTL_TISSUE_EXPRESSION/                 One .txt file per tissue (49 total)
+│   ├── Breast_Mammary_Tissue.v10.eGenes.txt
+│   ├── Whole_Blood.v10.eGenes.txt
+│   └── ...
+├── GTEx_EQTL_SAMPLE_COUNTS/
+│   └── EQTL-SAMPLE-COUNT-GTEx Portal.csv        Sample sizes per tissue
+└── plink/
+    ├── plink.exe (Windows) or plink (Linux)      PLINK 1.9 binary
+    ├── 1000G_EUR_hg38.bed                        LD reference panel
+    ├── 1000G_EUR_hg38.bim                        (rename from g1000_eur.*)
+    └── 1000G_EUR_hg38.fam
+
+================================================================================
