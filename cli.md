@@ -5,7 +5,7 @@
 ### PowerShell
 
 ```powershell
-.\run_pipeline.ps1 "C:\Users\shahr\Downloads\GWAS-eQTL Mendelian Randomization Pipeline\Chronic_Kidney_Disease_100_genes (1).csv" -Disease "Chronic Kidney Disease" -Biosample "Kidney Tissue"
+.\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\degs.csv" -Disease "diabetes mellitus" -Biosample "Urine Cell Pallet"
 ```
 
 ### Command Prompt

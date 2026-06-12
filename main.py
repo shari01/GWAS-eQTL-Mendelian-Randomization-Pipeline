@@ -86,11 +86,8 @@ def main() -> None:
             flush=True,
         )
 
-    print(
-        f"[RUN] disease={args.disease} | biosample={args.biosample} | "
-        f"deg_file={deg_path if deg_path else 'none'}",
-        flush=True,
-    )
+    print(f"[RUN] disease={args.disease} | biosample={args.biosample}", flush=True)
+    print(f"[RUN] deg_file={deg_path if deg_path else 'none'}", flush=True)
 
     run_full_pipeline(
         disease_name=args.disease,
@@ -114,3 +111,18 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── Usage examples ────────────────────────────────────────────────────────────
+#
+# AUTO mode  (-Biosample is any fluid/tissue description — LLM resolves it at temperature=0)
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "diabetes"             -Biosample "urine"
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "Alzheimer's disease"  -Biosample "CSF"
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "lupus"                -Biosample "PBMC"
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "Crohn's disease"      -Biosample "stool"
+#
+# MANUAL mode  (-Biosample is an exact filename from GTEx_eQTL_TISSUE_EXPRESSION\)
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "diabetes"             -Biosample "Kidney_Cortex.v10.eGenes.txt"
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "Alzheimer's disease"  -Biosample "Brain_Cortex.v10.eGenes.txt"
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "lupus"                -Biosample "Whole_Blood.v10.eGenes.txt"
+#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "type 2 diabetes"      -Biosample "Pancreas.v10.eGenes.txt"

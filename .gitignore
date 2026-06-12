@@ -24,6 +24,7 @@ __pycache__/
 Thumbs.db
 
 # Generated outputs
+pipeline_output_test/
 pipeline_output/
 pipeline_output*/
 GWAS_Data_Output/

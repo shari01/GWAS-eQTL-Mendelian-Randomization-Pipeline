@@ -140,20 +140,277 @@ def load_gtex_table(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def resolve_biosample_fuzzy(user_biosample: str, gtex_biosamples_set: Set[str]) -> Optional[str]:
-    """Exact / substring / fuzzy biosample matching against GTEx biosample list."""
+def _parse_tissue_from_eqtl_filename(filename: str) -> str:
+    """
+    Extract a human-readable tissue name from a GTEx eQTL filename.
+
+    Examples:
+      'Kidney_Cortex.v10.eGenes.txt'                          → 'kidney cortex'
+      'Brain_Anterior_cingulate_cortex_BA24.v10.eGenes.txt'   → 'brain anterior cingulate cortex ba24'
+      'Cells_EBV-transformed_lymphocytes.v10.eGenes.txt'      → 'cells ebv-transformed lymphocytes'
+    """
+    name = Path(filename).name
+    # Strip everything from '.v<digits>' onward (version + extension)
+    name = re.sub(r'\.v\d+.*$', '', name)
+    return name.replace('_', ' ').lower().strip()
+
+
+def find_manual_eqtl_file(
+    biosample_input: str,
+    eqtl_root: str,
+) -> Optional[tuple]:
+    """
+    Check whether the user passed a GTEx eQTL filename (or path) directly.
+
+    Accepts:
+      - Bare filename:  'Kidney_Cortex.v10.eGenes.txt'
+      - Full path:      '/path/to/GTEx_eQTL_TISSUE_EXPRESSION/Kidney_Cortex.v10.eGenes.txt'
+      - Relative path:  'GTEx_eQTL_TISSUE_EXPRESSION/Kidney_Cortex.v10.eGenes.txt'
+
+    Returns ``(Path, tissue_name_str)`` on success, or ``None`` if the input
+    does not look like a file reference.
+    """
+    eqtl_root_path = Path(eqtl_root)
+
+    # 1. Direct absolute / relative path that exists on disk
+    p = Path(biosample_input)
+    if p.exists() and p.is_file():
+        return p, _parse_tissue_from_eqtl_filename(p.name)
+
+    # 2. Bare filename inside eqtl_root
+    candidate = eqtl_root_path / biosample_input
+    if candidate.exists() and candidate.is_file():
+        return candidate, _parse_tissue_from_eqtl_filename(candidate.name)
+
+    # 3. Case-insensitive filename scan inside eqtl_root
+    biosample_lower = biosample_input.lower()
+    for p in eqtl_root_path.rglob("*.txt"):
+        if p.name.lower() == biosample_lower:
+            return p, _parse_tissue_from_eqtl_filename(p.name)
+
+    return None
+
+
+def _resolve_biosample_string(user_norm: str, gtex_biosamples_set: Set[str]) -> Optional[str]:
+    """
+    Pure string-based biosample resolver against the GTEx biosample CSV set.
+
+    Stages:
+      1. Exact match
+      2. User term is a substring of a GTEx tissue name  (e.g. 'blood' → 'whole blood')
+      3. Fuzzy character match with cutoff=0.6
+    """
+    if user_norm in gtex_biosamples_set:
+        return user_norm
+
+    for t in sorted(gtex_biosamples_set):
+        if user_norm in t:
+            return t
+
+    matches = get_close_matches(user_norm, sorted(gtex_biosamples_set), n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+def _resolve_biosample_llm(
+    user_biosample: str,
+    gtex_biosamples_set: Set[str],
+) -> Optional[str]:
+    """
+    Use GPT-4o-mini at temperature=0 to map any biological sample concept to the
+    most appropriate GTEx tissue.
+
+    The model receives the exact GTEx tissue list and no hardcoded examples —
+    it uses its own biomedical knowledge to reason about the relationship between
+    the sample type and available tissues.  It returns a ranked list of up to 3
+    candidates; we accept the first one whose name appears verbatim in the GTEx set.
+    """
+    from decouple import config, UndefinedValueError
+    try:
+        api_key = config("OPENAI_API_KEY")
+    except UndefinedValueError:
+        raise RuntimeError("OPENAI_API_KEY not set — cannot use LLM for biosample resolution.")
+
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    tissue_list = "\n".join(f"- {t}" for t in sorted(gtex_biosamples_set))
+
+    prompt = (
+        "You are a biomedical expert. Your task is to map a biological sample type "
+        "to the most appropriate GTEx tissue(s) from the provided list.\n\n"
+        "STRICT RULES:\n"
+        "1. Every tissue name in your response MUST be copied VERBATIM from the list "
+        "below — do not alter spacing, capitalisation, or spelling.\n"
+        "2. Apply your own biomedical knowledge to reason freshly for each input. "
+        "Do NOT use any pre-programmed examples or rules.\n"
+        "3. Return your top 3 choices ranked from most to least relevant.\n"
+        "4. Temperature is 0 — be fully deterministic.\n\n"
+        "BIOLOGICAL RELEVANCE RULE — this is critical:\n"
+        "Set 'is_biologically_relevant': true ONLY when there is a DIRECT biological "
+        "relationship between the sample type and the tissue:\n"
+        "  - The tissue physically produces or secretes the sample "
+        "(e.g. kidney produces urine, liver produces bile, brain produces CSF)\n"
+        "  - The sample is directly derived from or contained within the tissue "
+        "(e.g. PBMC from blood, synovial fluid from synovial membrane)\n"
+        "  - The tissue is the primary biological origin of the cells or molecules "
+        "in the sample\n"
+        "Set 'is_biologically_relevant': false for:\n"
+        "  - Anatomical proximity alone (organ is nearby but does not produce the sample)\n"
+        "  - Indirect relationships: provides oxygen, receives waste, shares blood supply\n"
+        "  - Functional co-regulation without direct sample derivation\n"
+        "If NO tissue has a direct biological relationship, set all to false — "
+        "do NOT pick a distant tissue just to give an answer.\n\n"
+        f"Available GTEx tissues (copy names exactly):\n{tissue_list}\n\n"
+        f"Biological sample type to map: \"{user_biosample}\"\n\n"
+        "Return JSON with this exact structure:\n"
+        '{\n'
+        '  "ranked_tissues": [\n'
+        '    {"tissue": "<exact name from list>", "reasoning": "<one sentence>", "is_biologically_relevant": true},\n'
+        '    {"tissue": "<exact name from list>", "reasoning": "<one sentence>", "is_biologically_relevant": false},\n'
+        '    {"tissue": "<exact name from list>", "reasoning": "<one sentence>", "is_biologically_relevant": false}\n'
+        '  ]\n'
+        '}'
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(resp.choices[0].message.content)
+    ranked = data.get("ranked_tissues", [])
+
+    for item in ranked:
+        if not item.get("is_biologically_relevant", False):
+            log(
+                f"[LLM-BIOSAMPLE] Skipping '{item.get('tissue')}' — not directly relevant: "
+                f"{item.get('reasoning', '')}"
+            )
+            continue
+        tissue = str(item.get("tissue", "")).strip().lower()
+        reasoning = item.get("reasoning", "")
+        if tissue in gtex_biosamples_set:
+            log(f"[LLM-BIOSAMPLE] '{user_biosample}' → '{tissue}' | {reasoning}")
+            return tissue
+        # Model may return mixed-case — normalise and retry
+        if tissue and tissue in {t.lower() for t in gtex_biosamples_set}:
+            matched = next(t for t in gtex_biosamples_set if t.lower() == tissue)
+            log(f"[LLM-BIOSAMPLE] '{user_biosample}' → '{matched}' | {reasoning}")
+            return matched
+
+    log(
+        f"[WARN] LLM found no biologically relevant tissue for '{user_biosample}'. "
+        f"No indirect/proximity matches accepted. "
+        f"LLM returned: {[i.get('tissue') for i in ranked]}"
+    )
+    return None
+
+
+def _select_gwas_trait_llm(
+    available_traits: List[str],
+    disease_name: str,
+    biosample_type: str,
+) -> Optional[str]:
+    """
+    Use GPT-4o-mini at temperature=0 to pick the single most biologically
+    appropriate GWAS trait from ``available_traits``, given both the disease
+    name and the biosample/tissue context.
+
+    Passing biosample context matters: e.g. disease='diabetes' + biosample='urine'
+    should prefer 'diabetic nephropathy' over generic 'type 2 diabetes mellitus'
+    when both are available.
+    """
+    from decouple import config, UndefinedValueError
+    try:
+        api_key = config("OPENAI_API_KEY")
+    except UndefinedValueError:
+        raise RuntimeError("OPENAI_API_KEY not set — cannot use LLM for GWAS trait selection.")
+
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    trait_list = "\n".join(f"- {t}" for t in sorted(set(available_traits)))
+
+    prompt = (
+        "You are a biomedical expert selecting the most appropriate GWAS study trait.\n\n"
+        "CONTEXT:\n"
+        f"  Target disease: {disease_name}\n"
+        f"  Biosample / tissue type: {biosample_type}\n\n"
+        "TASK:\n"
+        "From the list of available GWAS traits below, choose the single trait that "
+        "is most biologically relevant to the target disease AND consistent with the "
+        "biosample/tissue type provided.\n\n"
+        "STRICT RULES:\n"
+        "1. Your answer MUST be copied VERBATIM from the list — do not alter spelling or case.\n"
+        "2. Use your own biomedical knowledge to reason about the match. "
+        "Consider disease subtypes, tissue specificity, and clinical context. "
+        "Do NOT rely on any pre-programmed rules — reason freshly.\n"
+        "3. If several traits are equally close, prefer the one most specific to the "
+        "given biosample/tissue context.\n"
+        "4. Temperature is 0 — give a single deterministic answer.\n\n"
+        f"Available GWAS traits:\n{trait_list}\n\n"
+        "Return JSON:\n"
+        '{"selected_trait": "<exact trait name from list>", "reasoning": "<one sentence>"}'
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(resp.choices[0].message.content)
+    selected = str(data.get("selected_trait", "")).strip()
+    reasoning = data.get("reasoning", "")
+
+    # Build a case-insensitive lookup
+    trait_lower_map = {t.lower(): t for t in available_traits}
+    matched = trait_lower_map.get(selected.lower())
+    if matched:
+        log(
+            f"[LLM-TRAIT] disease='{disease_name}' + biosample='{biosample_type}' "
+            f"→ '{matched}' | {reasoning}"
+        )
+        return matched
+
+    log(
+        f"[WARN] LLM selected trait '{selected}' not found verbatim in the "
+        f"available traits list — discarding."
+    )
+    return None
+
+
+def resolve_biosample(
+    user_biosample: str,
+    gtex_biosamples_set: Set[str],
+    use_llm: bool = True,
+) -> Optional[str]:
+    """
+    Resolve any biological sample description to a valid GTEx tissue name.
+
+    Strategy (in order):
+      1. String matching  — exact → substring → fuzzy ≥0.6
+      2. LLM ranked mapping at temperature=0  (skipped if use_llm=False)
+      3. Return None  (caller handles fallback / warning)
+    """
     if not user_biosample:
         return None
     user_norm = user_biosample.lower().strip()
 
-    for t in gtex_biosamples_set:
-        if user_norm == t:
-            return t
-        if user_norm in t or t in user_norm:
-            return t
+    result = _resolve_biosample_string(user_norm, gtex_biosamples_set)
+    if result:
+        return result
 
-    matches = get_close_matches(user_norm, list(gtex_biosamples_set), n=1, cutoff=0.4)
-    return matches[0] if matches else None
+    if use_llm:
+        try:
+            result = _resolve_biosample_llm(user_biosample, gtex_biosamples_set)
+            if result:
+                return result
+        except Exception as exc:
+            log(f"[WARN] LLM biosample resolver failed: {exc}")
+
+    return None
 
 
 def gtex_sample_counts(
@@ -343,6 +600,16 @@ def download_resume(url: str, out: str, max_retries: int = 5) -> None:
                     continue
 
                 r.raise_for_status()
+                # Guard: if we sent a Range header but the server returned 200
+                # (full content) instead of 206, appending would corrupt the file.
+                # Delete the partial file and restart from byte 0.
+                if existing_size > 0 and r.status_code == 200:
+                    log(
+                        "[WARN] Server ignored Range request (returned 200, not 206). "
+                        "Deleting partial file and restarting from byte 0 to avoid corruption."
+                    )
+                    out.unlink(missing_ok=True)
+                    existing_size = 0
                 remaining = int(r.headers.get("content-length", 0))
                 full_size = existing_size + remaining
                 downloaded = 0
@@ -413,10 +680,18 @@ def list_harmonised_files(harmonised_url: str) -> List[str]:
         return []
 
 
-def mirror_harmonised_folder(harmonised_url: str, out_dir: Path) -> Dict[str, Any]:
+def mirror_harmonised_folder(
+    harmonised_url: str,
+    out_dir: Path,
+    preloaded_gz: Optional[Path] = None,
+) -> Dict[str, Any]:
     """
     Download all files from harmonised folder into ``out_dir/harmonised/``.
     Unzips the first ``.h.tsv.gz`` encountered.
+
+    If ``preloaded_gz`` is provided and points to an existing file, the
+    ``.h.tsv.gz`` is moved from that path instead of being re-downloaded,
+    saving several GB of bandwidth.
     """
     harm_dir = out_dir / "harmonised"
     harm_dir.mkdir(parents=True, exist_ok=True)
@@ -432,9 +707,25 @@ def mirror_harmonised_folder(harmonised_url: str, out_dir: Path) -> Dict[str, An
     for f in files:
         if f.endswith("/"):
             continue
-        url = harmonised_url.rstrip("/") + "/" + f
         out_path = harm_dir / f
 
+        if f.endswith(".h.tsv.gz") and gwas_gz is None:
+            # Reuse the file already downloaded during overlap evaluation
+            if preloaded_gz is not None and preloaded_gz.exists():
+                if not out_path.exists():
+                    log(f"[REUSE] Moving pre-evaluated file to final destination (skipping re-download): {f}")
+                    shutil.move(str(preloaded_gz), str(out_path))
+                else:
+                    log(f"[SKIP] {f} already present at destination")
+                downloaded.append(str(out_path))
+                gwas_gz = out_path
+                tsv_out = harm_dir / f.replace(".gz", "")
+                if gunzip_file(gwas_gz, tsv_out):
+                    gwas_tsv = tsv_out
+                    log(f"Unzipped -> {tsv_out}")
+                continue
+
+        url = harmonised_url.rstrip("/") + "/" + f
         try:
             log(f"Downloading harmonised file: {f}")
             download_resume(url, str(out_path), max_retries=HTTP_RETRIES)
@@ -624,7 +915,13 @@ def evaluate_candidate_overlap(
     gz_filename: str,
     eqtl_snps: Set[str],
 ) -> Dict[str, Any]:
-    """Download a candidate ``.h.tsv.gz``, compute eQTL overlap, clean up."""
+    """Download a candidate ``.h.tsv.gz`` and compute eQTL overlap.
+
+    On success the downloaded file is kept so the caller can reuse it for the
+    final download step (avoiding a second download of the same file).
+    The caller is responsible for cleaning up ``tmp_dir`` when done.
+    On failure the temp dir is cleaned up internally and tmp_path/tmp_dir are None.
+    """
     gz_url = harmonised_url.rstrip("/") + "/" + gz_filename
     tmp_dir = Path(tempfile.mkdtemp(prefix="gwas_eval_"))
     tmp_path = tmp_dir / gz_filename
@@ -636,12 +933,13 @@ def evaluate_candidate_overlap(
         return {
             "variant_count": len(gwas_rsids),
             "overlap_count": len(overlap),
+            "tmp_path": tmp_path,
+            "tmp_dir": tmp_dir,
         }
     except Exception as exc:
         log(f"[WARN] Overlap evaluation failed for {gz_filename}: {exc}")
-        return {"variant_count": 0, "overlap_count": 0}
-    finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        return {"variant_count": 0, "overlap_count": 0, "tmp_path": None, "tmp_dir": None}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -739,10 +1037,10 @@ def retrieve_gwas_data(
     hits = _search_terms([normalized_name])
     if hits.empty and synonyms:
         hits = _search_terms(synonyms)
+    broad_hits = hits.copy()  # keep for LLM fallback before exact filtering narrows it
 
     if hits.empty:
-        log("No GWAS dataset found (EUR + summaryStats required).")
-        return []
+        log("No GWAS dataset found via broad match — will try LLM trait selection from all EUR studies.")
 
     log(f"Found {len(hits)} GWAS rows (broad match).")
 
@@ -753,28 +1051,97 @@ def retrieve_gwas_data(
         synonyms=synonyms,
         wait_seconds=5,
     )
+
+    # ── LLM trait fallback (two levels) ───────────────────────────────────
+    if hits.empty and use_llm:
+        # Level 1: pick from the broad substring-match results
+        if not broad_hits.empty:
+            broad_traits = sorted(set(broad_hits["efoTraits"].dropna().astype(str).tolist()))
+            log(
+                f"[LLM-TRAIT] Exact match failed. Asking LLM to pick closest trait "
+                f"from {len(broad_traits)} broad-match candidates "
+                f"(disease='{normalized_name}', biosample='{biosample_type}')..."
+            )
+            try:
+                selected = _select_gwas_trait_llm(broad_traits, normalized_name, biosample_type)
+                if selected:
+                    hits = broad_hits[
+                        broad_hits["efoTraits"].astype(str).str.lower().str.strip()
+                        == selected.lower().strip()
+                    ]
+            except Exception as exc:
+                log(f"[WARN] LLM trait selection (level 1) failed: {exc}")
+
+        # Level 2: broad search was also empty — try from ALL EUR studies
+        if hits.empty:
+            log(
+                f"[LLM-TRAIT] Broad search empty or LLM level-1 failed. "
+                f"Expanding to all EUR GWAS studies..."
+            )
+            try:
+                all_eur = df[df["summaryStatistics"].notna() & df["is_EUR"]]
+                trait_series = all_eur["efoTraits"].dropna().astype(str)
+                # Sort by study count descending so the 300-cap keeps the most-studied
+                # traits (covers all common diseases regardless of starting letter).
+                trait_counts = trait_series.value_counts()
+                all_traits = trait_counts.index.tolist()[:300]
+                log(
+                    f"[LLM-TRAIT] Asking LLM to pick from {len(all_traits)} EUR traits "
+                    f"(disease='{normalized_name}', biosample='{biosample_type}')..."
+                )
+                selected = _select_gwas_trait_llm(all_traits, normalized_name, biosample_type)
+                if selected:
+                    hits = all_eur[
+                        all_eur["efoTraits"].astype(str).str.lower().str.strip()
+                        == selected.lower().strip()
+                    ]
+            except Exception as exc:
+                log(f"[WARN] LLM trait selection (level 2) failed: {exc}")
+
     if hits.empty:
-        log("\nPipeline stopped safely (no clean GWAS phenotype).")
+        log("\nPipeline stopped: could not find a matching GWAS trait (exact, synonym, or LLM).")
         return []
 
-    log(f"Proceeding with exact phenotype: '{hits.iloc[0]['efoTraits']}'")
+    log(f"Proceeding with phenotype: '{hits.iloc[0]['efoTraits']}'")
 
     # ── Biosample resolution ─────────────────────────────────────────────
-    biosample_lower = biosample_type.strip().lower()
     gtex_df = load_gtex_table(gtex_biosample_csv)
     gtex_biosamples = set(gtex_df["Tissue"].astype(str).str.lower().str.strip())
 
-    resolved_biosample = resolve_biosample_fuzzy(biosample_lower, gtex_biosamples)
-    if not resolved_biosample:
-        log("[WARN] Could not confidently match biosample type -> fallback to Whole Blood")
-        resolved_biosample = "whole blood"
-    elif resolved_biosample != biosample_lower:
-        log(f"Biosample '{biosample_lower}' matched to GTEx entry: '{resolved_biosample}'")
+    # Path A — user passed an eQTL filename or file path directly
+    #   e.g.  biosample_type = "Kidney_Cortex.v10.eGenes.txt"
+    #   or    biosample_type = "GTEx_eQTL_TISSUE_EXPRESSION/Kidney_Cortex.v10.eGenes.txt"
+    manual_result = find_manual_eqtl_file(biosample_type, eqtl_root)
+    if manual_result:
+        eqtl_file, parsed_tissue = manual_result
+        log(f"[MANUAL] eQTL file provided directly: {eqtl_file.name}")
+        log(f"[MANUAL] Parsed tissue name: '{parsed_tissue}'")
+        # Resolve parsed tissue name to the GTEx biosample CSV for sample counts
+        user_biosample = resolve_biosample(parsed_tissue, gtex_biosamples, use_llm=use_llm) or parsed_tissue
+        log(f"[MANUAL] Mapped to GTEx biosample entry: '{user_biosample}'")
+    else:
+        # Path B — user passed a tissue name / biosample description; resolve it
+        biosample_lower = biosample_type.strip().lower()
+        resolved_biosample = resolve_biosample(biosample_lower, gtex_biosamples, use_llm=use_llm)
+        if not resolved_biosample:
+            sorted_tissues = sorted(gtex_biosamples)
+            log(
+                f"\n[ERROR] Could not map biosample '{biosample_type}' to any GTEx tissue.\n"
+                f"  String matching and LLM both returned no biologically relevant match.\n"
+                f"  To avoid using an irrelevant tissue, the pipeline cannot proceed.\n"
+                f"  Use MANUAL mode with an exact GTEx filename, e.g.:\n"
+                f"    -Biosample \"Kidney_Cortex.v10.eGenes.txt\"\n"
+                f"  Available GTEx tissues:\n"
+                + "\n".join(f"    - {t}" for t in sorted_tissues)
+            )
+            return []
+        elif resolved_biosample != biosample_lower:
+            log(f"[OK] Biosample '{biosample_type}' resolved to GTEx tissue: '{resolved_biosample}'")
 
-    user_biosample = resolved_biosample
-    eqtl_file = find_eqtl_file(eqtl_root, user_biosample)
+        user_biosample = resolved_biosample
+        eqtl_file = find_eqtl_file(eqtl_root, user_biosample)
+
     rnaseq_n, genotype_n = gtex_sample_counts(gtex_df, user_biosample)
-
     log(f"Selected biosample type: {user_biosample}")
     log(f"Selected eQTL file: {eqtl_file}")
     log(f"GTEx RNA-seq N: {rnaseq_n} | Genotype N: {genotype_n}")
@@ -937,6 +1304,8 @@ def retrieve_gwas_data(
                     ),
                     "overlap_count": -1,
                     "variant_count": 0,
+                    "tmp_path": None,
+                    "tmp_dir": None,
                 })
 
             if not candidates:
@@ -981,6 +1350,8 @@ def retrieve_gwas_data(
                     )
                     cand["variant_count"] = info["variant_count"]
                     cand["overlap_count"] = info["overlap_count"]
+                    cand["tmp_path"] = info.get("tmp_path")
+                    cand["tmp_dir"] = info.get("tmp_dir")
                     pct = cand["overlap_count"] / n_inst * 100
                     log(
                         f"    variants={cand['variant_count']:,}, "
@@ -1045,13 +1416,28 @@ def retrieve_gwas_data(
                     key=lambda c: (c["harm_score"], c["n_num"]),
                     reverse=True,
                 )
-                best = candidates[0]["row"]
+                selected = candidates[0]
+                best = selected["row"]
+
+            # Reuse the file already downloaded during overlap evaluation for
+            # the winning candidate, and clean up all loser temp dirs now.
+            winner_tmp_gz: Optional[Path] = selected.get("tmp_path")
+            winner_tmp_dir: Optional[Path] = selected.get("tmp_dir")
+            for cand in candidates:
+                td = cand.get("tmp_dir")
+                if td is not None and td != winner_tmp_dir:
+                    shutil.rmtree(str(td), ignore_errors=True)
 
             harmonised_url = (
                 str(best["summaryStatistics"]).rstrip("/") + "/harmonised/"
             )
             log(f"[DOWNLOAD] Downloading GWAS from {harmonised_url}")
-            mirror_info = mirror_harmonised_folder(harmonised_url, out_dir)
+            mirror_info = mirror_harmonised_folder(
+                harmonised_url, out_dir, preloaded_gz=winner_tmp_gz
+            )
+            # Winner's temp dir is now safe to remove (file was moved or unused)
+            if winner_tmp_dir is not None:
+                shutil.rmtree(str(winner_tmp_dir), ignore_errors=True)
 
         # ── Build result row ───────────────────────────────────────────────
         n_eqtl_for_mr = genotype_n if genotype_n is not None else rnaseq_n
