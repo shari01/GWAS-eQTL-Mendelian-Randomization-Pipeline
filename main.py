@@ -113,16 +113,3 @@ if __name__ == "__main__":
     main()
 
 
-# ── Usage examples ────────────────────────────────────────────────────────────
-#
-# AUTO mode  (-Biosample is any fluid/tissue description — LLM resolves it at temperature=0)
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "diabetes"             -Biosample "urine"
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "Alzheimer's disease"  -Biosample "CSF"
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "lupus"                -Biosample "PBMC"
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "Crohn's disease"      -Biosample "stool"
-#
-# MANUAL mode  (-Biosample is an exact filename from GTEx_eQTL_TISSUE_EXPRESSION\)
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "diabetes"             -Biosample "Kidney_Cortex.v10.eGenes.txt"
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "Alzheimer's disease"  -Biosample "Brain_Cortex.v10.eGenes.txt"
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "lupus"                -Biosample "Whole_Blood.v10.eGenes.txt"
-#   .\run_pipeline.ps1 "D:\AyassBio_Workspace_Downloads\sabhat-dataset-tr\lupus-degs.csv" -Disease "type 2 diabetes"      -Biosample "Pancreas.v10.eGenes.txt"
